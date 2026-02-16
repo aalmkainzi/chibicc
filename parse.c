@@ -3445,12 +3445,13 @@ void np_not_exist_error(Nameprefix *in_scope_of, FXS_StrView name)
 {
   if(in_scope_of == NULL)
   {
-    fxs_fprint(stderr, "_Nameprefix ", name ," doesn't exist");
+    fxs_fprintln(stderr, "_Nameprefix ", name ," doesn't exist");
   }
   else
   {
     FXS_DStr full_name = get_np_full_name(in_scope_of);
-    fxs_fprint(stderr, "_Nameprefix ", name ," doesn't exist in ", full_name);
+    fxs_fprintln(stderr, "_Nameprefix ", name ," doesn't exist in ", full_name);
+    fxs_dstr_deinit(&full_name);
   }
   exit(1);
 }
@@ -3460,7 +3461,7 @@ void np_not_exist_error(Nameprefix *in_scope_of, FXS_StrView name)
 Nameprefix *get_np_by_name(Nameprefix *in_scope_of, Token **tokp)
 {
   Token *tok = *tokp;
-  expect_tk_kind(tok, TK_STR);
+  expect_tk_kind(tok, TK_IDENT);
   FXS_StrView np_name = strvtok(tok);
   tok = tok->next;
   Nameprefix *np = get_np(in_scope_of, np_name);
@@ -3474,7 +3475,7 @@ Nameprefix *get_np_by_name(Nameprefix *in_scope_of, Token **tokp)
   while(fxs_equal(strvtok(tok), "::"))
   {
     tok = skip(tok, "::");
-    expect_tk_kind(tok, TK_STR);
+    expect_tk_kind(tok, TK_IDENT);
     FXS_StrView child_name = strvtok(tok);
     tok = tok->next;
     
@@ -3510,6 +3511,11 @@ Nameprefix *create_np(Nameprefix *parent, FXS_StrView name)
     NPVec_push(&parent->nested_entries, new_np);
   }
   return new_np;
+}
+
+FXS_StrView unquote(FXS_StrView s)
+{
+  return fxs_strv(s, 1, s.len - 1);
 }
 
 Token *parse_np(Token *tok)
@@ -3552,7 +3558,9 @@ Token *parse_np(Token *tok)
   {
     if(!fxs_equal(np->prefix, strvtok(tok)))
     {
-      fxs_fprintln(stderr, "Redeclaration of _Nameprefix ", np->name, " with a different prefix: ", strvtok(tok), ". Previously declared with: ", np->prefix);
+      FXS_DStr full_name = get_np_full_name(np);
+      fxs_fprintln(stderr, "Redeclaration of _Nameprefix ", full_name, " with a different prefix: ", strvtok(tok), ". Previously declared with: ", np->prefix);
+      fxs_dstr_deinit(&full_name);
       exit(1);
     }
   }
@@ -3563,11 +3571,18 @@ Token *parse_np(Token *tok)
   
   if(parent != NULL)
   {
-    if(!fxs_starts_with(np->prefix, parent->prefix))
+    if(!fxs_starts_with(
+        unquote(np->prefix),
+        unquote(parent->prefix)
+       )
+    )
     {
       FXS_DStr np_full_name = get_np_full_name(np);
       
       fxs_fprintln(stderr, "_Nameprefix ", np_full_name, "'s prefix ", np->prefix , " must start with its parent's prefix ", parent->prefix);
+      
+      fxs_dstr_deinit(&np_full_name);
+      
       exit(1);
     }
   }
@@ -3610,8 +3625,8 @@ Token *parse_np_scope(Token *tok)
     CapturePrefixScopeMapping mapping = {.np = mapped_to_np};
     CapturePrefixScope_push(capture_scope, mapping);
     
-    FXS_StrView comma = strvtok(tok);
-    while(fxs_equal(comma, ","))
+    FXS_StrView tokview = strvtok(tok);
+    while(fxs_equal(tokview, ","))
     {
       tok = skip(tok, ",");
       Nameprefix *mapped_to_np = get_np_by_name(NULL, &tok);
@@ -3622,7 +3637,7 @@ Token *parse_np_scope(Token *tok)
   else
   {
     ApplyPrefixScope *apply_scope = &new_scope->scope.apply_scope;
-    if(!np_scope_stack->is_capture)
+    if(np_scope_stack != NULL && !np_scope_stack->is_capture)
     {
       apply_scope->np = get_np_by_name(np_scope_stack->scope.apply_scope.np, &tok);
       tok = skip(tok, "{");
@@ -3636,6 +3651,8 @@ Token *parse_np_scope(Token *tok)
   
   new_scope->up = np_scope_stack;
   np_scope_stack = new_scope;
+  
+  return tok;
 }
 
 // program = (typedef | function-definition | global-variable)*
@@ -3647,9 +3664,22 @@ Obj *parse(Token *tok) {
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
     
+    if(fxs_equal(strvtok(tok), "}") && np_scope_stack != NULL)
+    {
+      np_scope_stack = np_scope_stack->up;
+      tok = skip(tok, "}");
+      continue;
+    }
+    
     if(tok->len == strlen("_Nameprefix") && memcmp(tok->loc, "_Nameprefix", tok->len) == 0)
     {
       tok = parse_np(tok);
+      continue;
+    }
+    
+    if(fxs_equal(strvtok(tok), "_Apply") || fxs_equal(strvtok(tok), "_Capture"))
+    {
+      tok = parse_np_scope(tok);
       continue;
     }
     
