@@ -18,6 +18,9 @@
 #include <time.h>
 #include <unistd.h>
 
+// #define FXS_SHORT_NAMES
+#include "fxs.h"
+
 #define MAX(x, y) ((x) < (y) ? (y) : (x))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
@@ -59,6 +62,17 @@ typedef enum {
   TK_EOF,     // End-of-file markers
 } TokenKind;
 
+static char *token_kind_str[] =
+{
+  [TK_IDENT] = "TK_IDENT",  
+  [TK_PUNCT] = "TK_PUNCT",  
+  [TK_KEYWORD] = "TK_KEYWORD",
+  [TK_STR] = "TK_STR",    
+  [TK_NUM] = "TK_NUM",    
+  [TK_PP_NUM] = "TK_PP_NUM", 
+  [TK_EOF] = "TK_EOF",
+};
+
 typedef struct {
   char *name;
   int file_no;
@@ -95,9 +109,9 @@ noreturn void error(char *fmt, ...) __attribute__((format(printf, 1, 2)));
 noreturn void error_at(char *loc, char *fmt, ...) __attribute__((format(printf, 2, 3)));
 noreturn void error_tok(Token *tok, char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void warn_tok(Token *tok, char *fmt, ...) __attribute__((format(printf, 2, 3)));
-bool equal(Token *tok, char *op);
-Token *skip(Token *tok, char *op);
-bool consume(Token **rest, Token *tok, char *str);
+bool equal(Token *tok, const char *op);
+Token *skip(Token *tok, const char *op);
+bool consume(Token **rest, Token *tok, const char *str);
 void convert_pp_tokens(Token *tok);
 File **get_input_files(void);
 File *new_file(char *name, int file_no, char *contents);
@@ -106,7 +120,7 @@ Token *tokenize(File *file);
 Token *tokenize_file(char *filename);
 
 #define unreachable() \
-  error("internal error at %s:%d", __FILE__, __LINE__)
+ error("internal error at %s:%d", __FILE__, __LINE__)
 
 //
 // preprocess.c

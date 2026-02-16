@@ -76,18 +76,18 @@ void warn_tok(Token *tok, char *fmt, ...) {
 }
 
 // Consumes the current token if it matches `op`.
-bool equal(Token *tok, char *op) {
+bool equal(Token *tok, const char *op) {
   return memcmp(tok->loc, op, tok->len) == 0 && op[tok->len] == '\0';
 }
 
 // Ensure that the current token is `op`.
-Token *skip(Token *tok, char *op) {
+Token *skip(Token *tok, const char *op) {
   if (!equal(tok, op))
     error_tok(tok, "expected '%s'", op);
   return tok->next;
 }
 
-bool consume(Token **rest, Token *tok, char *str) {
+bool consume(Token **rest, Token *tok, const char *str) {
   if (equal(tok, str)) {
     *rest = tok->next;
     return true;
@@ -145,7 +145,7 @@ static int read_punct(char *p) {
   static char *kw[] = {
     "<<=", ">>=", "...", "==", "!=", "<=", ">=", "->", "+=",
     "-=", "*=", "/=", "++", "--", "%=", "&=", "|=", "^=", "&&",
-    "||", "<<", ">>", "##",
+    "||", "<<", ">>", "##", "::"
   };
 
   for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
@@ -167,7 +167,7 @@ static bool is_keyword(Token *tok) {
       "unsigned", "const", "volatile", "auto", "register", "restrict",
       "__restrict", "__restrict__", "_Noreturn", "float", "double",
       "typeof", "asm", "_Thread_local", "__thread", "_Atomic",
-      "__attribute__",
+      "__attribute__", "_Nameprefix", "_Capture", "_Apply"
     };
 
     for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)

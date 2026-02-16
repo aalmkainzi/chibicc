@@ -17,6 +17,18 @@
 // parser.
 
 #include "chibicc.h"
+#include "stc/common.h"
+#include <stdlib.h>
+
+struct Nameprefix;
+typedef struct Nameprefix Nameprefix;
+struct NameprefixEntry;
+typedef struct NameprefixEntry NameprefixEntry;
+
+#define T NPVec, Nameprefix*
+#include "stc/vec.h"
+
+declare_vec(NPEntries, NameprefixEntry);
 
 // Scope for local variables, global variables, typedefs
 // or enum constants
@@ -79,6 +91,54 @@ struct InitDesg {
   Member *member;
   Obj *var;
 };
+
+typedef struct NameprefixEntry
+{
+  HashMap *hm;
+  char *key;
+} NameprefixEntry;
+
+#define i_declared
+#define T NPEntries, NameprefixEntry
+#include "stc/vec.h"
+
+struct Nameprefix
+{
+  struct Nameprefix *parent;
+  
+  FXS_StrView name;
+  FXS_StrView prefix;
+  NPEntries entries;
+  NPVec nested_entries;
+};
+
+typedef struct ApplyPrefixScope
+{
+  Nameprefix *np;
+} ApplyPrefixScope;
+
+typedef struct CapturePrefixScopeMapping
+{
+  Nameprefix *np;
+} CapturePrefixScopeMapping;
+
+#define T CapturePrefixScope, CapturePrefixScopeMapping
+#include "stc/vec.h"
+
+typedef struct NameprefixScope
+{
+  bool is_capture;
+  union
+  {
+    CapturePrefixScope capture_scope;
+    ApplyPrefixScope apply_scope;
+  } scope;
+  
+  struct NameprefixScope *up;
+} NameprefixScope;
+
+static NameprefixScope *np_scope;
+static NPVec outer_np;
 
 // All local variable instances created during parsing are
 // accumulated to this list.
@@ -3333,6 +3393,194 @@ static void declare_builtin_functions(void) {
   builtin_alloca->is_definition = false;
 }
 
+FXS_StrView strvtok(Token *tok)
+{
+  FXS_StrView v = {.chars = (unsigned char*) tok->loc, .len = tok->len};
+  return v;
+}
+
+Nameprefix *get_np(Nameprefix *parent, FXS_StrView np)
+{
+  NPVec *vec = &outer_np;
+  if(parent != NULL)
+  {
+    vec = &parent->nested_entries;
+  }
+  
+  for(c_each(it, NPVec, *vec))
+  {
+    if(fxs_equal(it.ref[0]->name, np))
+    {
+      return it.ref[0];
+    }
+  }
+  return NULL;
+}
+
+Nameprefix *get_np_by_name(Nameprefix *in_scope_of, Token *tok)
+{
+  FXS_StrView np_name = strvtok(tok);
+  Nameprefix *np = get_np(in_scope_of, np_name);
+  
+  if(np == NULL)
+  {
+    if(in_scope_of == NULL)
+      fxs_fprint(stderr, "_Nameprefix ", np_name ," doesn't exist");
+    else
+      fxs_fprint(stderr, "_Nameprefix ", np_name ," doesn't exist in ", in_scope_of->name);
+  }
+  
+  while(fxs_equal(strvtok(tok), "::"))
+  {
+    tok = skip(tok, "::");
+    Nameprefix *child = get_np(np, strvtok(tok));
+    
+  }
+}
+
+Nameprefix *create_np(Nameprefix *parent, FXS_StrView name)
+{
+  Nameprefix *new_np = calloc(1, sizeof(Nameprefix));
+  new_np->parent = parent;
+  new_np->prefix = (FXS_StrView){0};
+  new_np->name = name;
+  new_np->entries = NPEntries_init();
+  new_np->nested_entries = NPVec_init();
+  
+  if(parent == NULL)
+  {
+    NPVec_push(&outer_np, new_np);
+  }
+  else
+  {
+    NPVec_push(&parent->nested_entries, new_np);
+  }
+  return new_np;
+}
+
+
+void expect_tk_kind(Token *tok, TokenKind kind)
+{
+  if(tok->kind != kind)
+  {
+    error_tok(tok, "Expected token %s, but got %s", token_kind_str[kind], token_kind_str[tok->kind]);
+  }
+}
+
+Token *parse_np(Token *tok)
+{
+  // _Nameprefix A = "A_";
+  // _Nameprefix A::B = "A_B_";
+  
+  // TODO replace asserts with errors dignostics
+  
+  tok = skip(tok, "_Nameprefix");
+  expect_tk_kind(tok, TK_IDENT);
+  
+  FXS_StrView npname = strvtok(tok);
+  
+  Nameprefix *parent = NULL;
+  Nameprefix *np = get_np(parent, npname);
+  
+  tok = tok->next;
+  
+  // if parent _Nameprefix not found, and the code makes children of it, this will crash (deref NULL)
+  
+  while(equal(tok, "::"))
+  {
+    tok = skip(tok, "::");
+    parent = np;
+    npname = strvtok(tok);
+    tok = tok->next;
+    np = get_np(parent, npname);
+  }
+  
+  
+  if(np == NULL)
+  {
+    np = create_np(parent, npname);
+  }
+  
+  tok = skip(tok, "=");
+  expect_tk_kind(tok, TK_STR);
+  
+  // re-decl of _Nameprefix is allowed ONLY IF it's identical to previous decl
+  if(np->prefix.chars != NULL)
+  {
+    if(!fxs_equal(np->prefix, strvtok(tok)))
+    {
+      fxs_fprintln(stderr, "Redeclaration of _Nameprefix ", np->name, " with a different prefix: ", strvtok(tok), ". Previously declared with: ", np->prefix);
+      exit(1);
+    }
+  }
+  else
+  {
+    np->prefix = strvtok(tok);
+  }
+  
+  if(parent != NULL)
+  {
+    if(!fxs_starts_with(np->prefix, parent->prefix))
+    {
+      FXS_DStr full_np_name = fxs_dstr_init();
+      fxs_append(&full_np_name, np->name);
+      
+      Nameprefix *parent_iter = np->parent;
+      while(parent_iter)
+      {
+        fxs_prepend(&full_np_name, "::");
+        fxs_prepend(&full_np_name, parent_iter->name);
+        parent_iter = parent_iter->parent;
+      }
+      
+      fxs_fprintln(stderr, "_Nameprefix ", full_np_name, "'s prefix ", np->prefix , " must start with its parent's prefix ", parent->prefix);
+      exit(1);
+    }
+  }
+  
+  tok = tok->next;
+  tok = skip(tok, ";");
+  return tok;
+}
+
+Token *parse_np_scope(Token *tok)
+{
+  NameprefixScope *new_scope = calloc(1, sizeof(NameprefixScope));
+  
+  FXS_StrView scope_kind = strvtok(tok);
+  if(fxs_equal(scope_kind, "_Capture"))
+  {
+    new_scope->is_capture = true;
+    tok = skip(tok, "_Capture");
+  }
+  else if(fxs_equal(scope_kind, "_Apply"))
+  {
+    new_scope->is_capture = false;
+    tok = skip(tok, "_Apply");
+  }
+  else
+  {
+    fxs_fprint(stderr, "Expected either _Capture or _Apply, got ", scope_kind);
+    exit(1);
+  }
+  
+  tok = skip(tok, "_Nameprefix");
+  
+  if(new_scope->is_capture)
+  {
+    CapturePrefixScope *capture_scope = &new_scope->scope.capture_scope;
+    *capture_scope = CapturePrefixScope_init();
+    
+    get_np();
+    CapturePrefixScopeMapping mapping = {.np};
+    CapturePrefixScope_push(capture_scope, );
+  }
+  else
+  {
+    
+  }
+}
+
 // program = (typedef | function-definition | global-variable)*
 Obj *parse(Token *tok) {
   declare_builtin_functions();
@@ -3341,7 +3589,13 @@ Obj *parse(Token *tok) {
   while (tok->kind != TK_EOF) {
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
-
+    
+    if(tok->len == strlen("_Nameprefix") && memcmp(tok->loc, "_Nameprefix", tok->len) == 0)
+    {
+      tok = parse_np(tok);
+      continue;
+    }
+    
     // Typedef
     if (attr.is_typedef) {
       tok = parse_typedef(tok, basety);
