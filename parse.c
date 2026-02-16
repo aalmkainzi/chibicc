@@ -137,8 +137,8 @@ typedef struct NameprefixScope
   struct NameprefixScope *up;
 } NameprefixScope;
 
-static NameprefixScope *np_scope;
-static NPVec outer_np;
+static NameprefixScope *np_scope_stack;
+static NPVec outer_nps;
 
 // All local variable instances created during parsing are
 // accumulated to this list.
@@ -3386,6 +3386,14 @@ static void scan_globals(void) {
   globals = head.next;
 }
 
+void expect_tk_kind(Token *tok, TokenKind kind)
+{
+  if(tok->kind != kind)
+  {
+    error_tok(tok, "Expected token %s, but got %s", token_kind_str[kind], token_kind_str[tok->kind]);
+  }
+}
+
 static void declare_builtin_functions(void) {
   Type *ty = func_type(pointer_to(ty_void));
   ty->params = copy_type(ty_int);
@@ -3401,7 +3409,7 @@ FXS_StrView strvtok(Token *tok)
 
 Nameprefix *get_np(Nameprefix *parent, FXS_StrView np)
 {
-  NPVec *vec = &outer_np;
+  NPVec *vec = &outer_nps;
   if(parent != NULL)
   {
     vec = &parent->nested_entries;
@@ -3417,25 +3425,71 @@ Nameprefix *get_np(Nameprefix *parent, FXS_StrView np)
   return NULL;
 }
 
-Nameprefix *get_np_by_name(Nameprefix *in_scope_of, Token *tok)
+FXS_DStr get_np_full_name(Nameprefix *np)
 {
+  FXS_DStr full_np_name = fxs_dstr_init();
+  fxs_append(&full_np_name, np->name);
+  
+  Nameprefix *parent_iter = np->parent;
+  while(parent_iter)
+  {
+    fxs_prepend(&full_np_name, "::");
+    fxs_prepend(&full_np_name, parent_iter->name);
+    parent_iter = parent_iter->parent;
+  }
+  
+  return full_np_name;
+}
+
+void np_not_exist_error(Nameprefix *in_scope_of, FXS_StrView name)
+{
+  if(in_scope_of == NULL)
+  {
+    fxs_fprint(stderr, "_Nameprefix ", name ," doesn't exist");
+  }
+  else
+  {
+    FXS_DStr full_name = get_np_full_name(in_scope_of);
+    fxs_fprint(stderr, "_Nameprefix ", name ," doesn't exist in ", full_name);
+  }
+  exit(1);
+}
+
+// TODO Currently, this only accepts nameprefix names actually nested in in_scope_of, in reality, it should resolve the names by moving upwards the np_scope_stack (unless capture scope is encountered)
+// actually maybe the current impl is fine, as it's used for scope openings, and apply-prefix scope can only open scopes of nested np's
+Nameprefix *get_np_by_name(Nameprefix *in_scope_of, Token **tokp)
+{
+  Token *tok = *tokp;
+  expect_tk_kind(tok, TK_STR);
   FXS_StrView np_name = strvtok(tok);
+  tok = tok->next;
   Nameprefix *np = get_np(in_scope_of, np_name);
+  
   
   if(np == NULL)
   {
-    if(in_scope_of == NULL)
-      fxs_fprint(stderr, "_Nameprefix ", np_name ," doesn't exist");
-    else
-      fxs_fprint(stderr, "_Nameprefix ", np_name ," doesn't exist in ", in_scope_of->name);
+    np_not_exist_error(in_scope_of, np_name);
   }
   
   while(fxs_equal(strvtok(tok), "::"))
   {
     tok = skip(tok, "::");
-    Nameprefix *child = get_np(np, strvtok(tok));
+    expect_tk_kind(tok, TK_STR);
+    FXS_StrView child_name = strvtok(tok);
+    tok = tok->next;
     
+    Nameprefix *child = get_np(np, child_name);
+    
+    if(child == NULL)
+    {
+      np_not_exist_error(np, child_name);
+    }
+    
+    np = child;
   }
+  
+  *tokp = tok;
+  return np;
 }
 
 Nameprefix *create_np(Nameprefix *parent, FXS_StrView name)
@@ -3449,7 +3503,7 @@ Nameprefix *create_np(Nameprefix *parent, FXS_StrView name)
   
   if(parent == NULL)
   {
-    NPVec_push(&outer_np, new_np);
+    NPVec_push(&outer_nps, new_np);
   }
   else
   {
@@ -3458,21 +3512,10 @@ Nameprefix *create_np(Nameprefix *parent, FXS_StrView name)
   return new_np;
 }
 
-
-void expect_tk_kind(Token *tok, TokenKind kind)
-{
-  if(tok->kind != kind)
-  {
-    error_tok(tok, "Expected token %s, but got %s", token_kind_str[kind], token_kind_str[tok->kind]);
-  }
-}
-
 Token *parse_np(Token *tok)
 {
   // _Nameprefix A = "A_";
   // _Nameprefix A::B = "A_B_";
-  
-  // TODO replace asserts with errors dignostics
   
   tok = skip(tok, "_Nameprefix");
   expect_tk_kind(tok, TK_IDENT);
@@ -3522,18 +3565,9 @@ Token *parse_np(Token *tok)
   {
     if(!fxs_starts_with(np->prefix, parent->prefix))
     {
-      FXS_DStr full_np_name = fxs_dstr_init();
-      fxs_append(&full_np_name, np->name);
+      FXS_DStr np_full_name = get_np_full_name(np);
       
-      Nameprefix *parent_iter = np->parent;
-      while(parent_iter)
-      {
-        fxs_prepend(&full_np_name, "::");
-        fxs_prepend(&full_np_name, parent_iter->name);
-        parent_iter = parent_iter->parent;
-      }
-      
-      fxs_fprintln(stderr, "_Nameprefix ", full_np_name, "'s prefix ", np->prefix , " must start with its parent's prefix ", parent->prefix);
+      fxs_fprintln(stderr, "_Nameprefix ", np_full_name, "'s prefix ", np->prefix , " must start with its parent's prefix ", parent->prefix);
       exit(1);
     }
   }
@@ -3566,19 +3600,42 @@ Token *parse_np_scope(Token *tok)
   
   tok = skip(tok, "_Nameprefix");
   
+  
   if(new_scope->is_capture)
   {
     CapturePrefixScope *capture_scope = &new_scope->scope.capture_scope;
     *capture_scope = CapturePrefixScope_init();
     
-    get_np();
-    CapturePrefixScopeMapping mapping = {.np};
-    CapturePrefixScope_push(capture_scope, );
+    Nameprefix *mapped_to_np = get_np_by_name(NULL, &tok);
+    CapturePrefixScopeMapping mapping = {.np = mapped_to_np};
+    CapturePrefixScope_push(capture_scope, mapping);
+    
+    FXS_StrView comma = strvtok(tok);
+    while(fxs_equal(comma, ","))
+    {
+      tok = skip(tok, ",");
+      Nameprefix *mapped_to_np = get_np_by_name(NULL, &tok);
+      CapturePrefixScopeMapping mapping = {.np = mapped_to_np};
+      CapturePrefixScope_push(capture_scope, mapping);
+    }
   }
   else
   {
-    
+    ApplyPrefixScope *apply_scope = &new_scope->scope.apply_scope;
+    if(!np_scope_stack->is_capture)
+    {
+      apply_scope->np = get_np_by_name(np_scope_stack->scope.apply_scope.np, &tok);
+      tok = skip(tok, "{");
+    }
+    else
+    {
+      apply_scope->np = get_np_by_name(NULL, &tok);
+      tok = skip(tok, "{");
+    }
   }
+  
+  new_scope->up = np_scope_stack;
+  np_scope_stack = new_scope;
 }
 
 // program = (typedef | function-definition | global-variable)*
