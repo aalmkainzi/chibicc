@@ -1,1 +1,12 @@
-int main(){return 0;};
+_Nameprefix A = "A__";
+
+_Apply _Nameprefix A
+{
+    int i = 10;
+}
+
+
+int main()
+{
+    return A::i;
+};

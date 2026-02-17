@@ -18,7 +18,11 @@
 
 #include "chibicc.h"
 #include "stc/common.h"
+#include "fxs.h"
 #include <stdlib.h>
+
+#define T SViews, FXS_StrView
+#include "stc/vec.h"
 
 struct Nameprefix;
 typedef struct Nameprefix Nameprefix;
@@ -94,8 +98,13 @@ struct InitDesg {
 
 typedef struct NameprefixEntry
 {
-  HashMap *hm;
-  char *key;
+  FXS_StrView name;
+  
+  bool is_tag;
+  union {
+    Type *tag;
+    VarScope *var;
+  } entry;
 } NameprefixEntry;
 
 #define i_declared
@@ -216,6 +225,25 @@ static bool is_function(Token *tok);
 static Token *function(Token *tok, Type *basety, VarAttr *attr);
 static Token *global_variable(Token *tok, Type *basety, VarAttr *attr);
 
+FXS_StrView unquote(FXS_StrView s)
+{
+  return fxs_strv(s, 1, s.len - 1);
+}
+
+FXS_StrView strvtok(Token *tok)
+{
+  FXS_StrView v = {.chars = (unsigned char*) tok->loc, .len = tok->len};
+  return v;
+}
+
+void expect_tk_kind(Token *tok, TokenKind kind)
+{
+  if(tok->kind != kind)
+  {
+    error_tok(tok, "Expected token %s, but got %s", token_kind_str[kind], token_kind_str[tok->kind]);
+  }
+}
+
 static int align_down(int n, int align) {
   return align_to(n - align + 1, align);
 }
@@ -230,16 +258,98 @@ static void leave_scope(void) {
   scope = scope->next;
 }
 
-// Find a variable by name.
-static VarScope *find_var(Token *tok) {
-  for (Scope *sc = scope; sc; sc = sc->next) {
-    VarScope *sc2 = hashmap_get2(&sc->vars, tok->loc, tok->len);
-    if (sc2)
-      return sc2;
+Nameprefix *get_nested_np(Nameprefix *parent, FXS_StrView nested_np_name)
+{
+  for(c_each(np_it, NPVec, parent->nested_entries))
+  {
+    if(fxs_equal(np_it.ref[0]->name, nested_np_name))
+    {
+      return np_it.ref[0];
+    }
   }
   return NULL;
 }
 
+// example of input:
+// A::B::var means what should be passed is {"A", "B"}, and it returns the nameprefix A::B
+static Nameprefix *get_np_from_access(SViews *access)
+{
+  // TODO call get_nested_np starting from current np of apply-prefix scope, moving up to find the entire access chain
+}
+
+// Find a variable by name.
+static VarScope *find_var(Token *tok, Token **next) {
+  // TODO What we should do is check for available names in current np
+  // and also check for np access
+  
+  FXS_StrView var_name = strvtok(tok->next);
+  bool np_access = fxs_equal(var_name, "::");
+  
+  if(!np_access)
+  {
+    Scope *found_in = NULL;
+    VarScope *ret = NULL;
+    for (found_in = scope; found_in; found_in = found_in->next) {
+      VarScope *sc2 = hashmap_get2(&found_in->vars, tok->loc, tok->len);
+      if (sc2)
+      {
+        ret = sc2;
+        break;
+      }
+    }
+    
+    if(ret != NULL && found_in->next != NULL) // not global
+    {
+      return ret;
+    }
+    
+    if(!np_scope_stack->is_capture)
+    {
+      Nameprefix *np = np_scope_stack->scope.apply_scope.np;
+      while(np)
+      {
+        for(c_each(ent, NPEntries, np->entries))
+        {
+          if(!ent.ref->is_tag && fxs_equal(ent.ref->name, var_name))
+          {
+            ret = ent.ref->entry.var;
+            goto found;
+          }
+        }
+        
+        np = np->parent;
+      }
+      
+      found:;
+    }
+    
+    return ret;
+  }
+  else
+  {
+    // here check for identifier in the specified nameprefix
+    // if inside apply-prefix scope, search relative to it
+    
+    SViews nps_accessed = SViews_init();
+    
+    FXS_StrView next_tok = strvtok(tok->next);
+    while(fxs_equal(next_tok, "::"))
+    {
+      SViews_push(&nps_accessed, strvtok(tok));
+      tok = tok->next->next;
+      next_tok = strvtok(tok->next);
+    }
+    
+    if(!np_scope_stack->is_capture) // inside an apply-prefix scope
+    {
+      
+    }
+  }
+  
+  return NULL;
+}
+
+// TODO should also check nameprefixes here
 static Type *find_tag(Token *tok) {
   for (Scope *sc = scope; sc; sc = sc->next) {
     Type *ty = hashmap_get2(&sc->tags, tok->loc, tok->len);
@@ -313,6 +423,20 @@ Node *new_cast(Node *expr, Type *ty) {
 }
 
 static VarScope *push_scope(char *name) {
+  if (scope->next == NULL) // file scope
+  {
+    // here we should check the current apply-prefix scope, and apply prefix to the name
+    if(np_scope_stack != NULL && !np_scope_stack->is_capture)
+    {
+      ApplyPrefixScope *apply_scope = &np_scope_stack->scope.apply_scope;
+      
+      FXS_StrView prefix = apply_scope->np->prefix;
+      FXS_DStr dup = fxs_dup(name);
+      fxs_prepend(&dup, unquote(prefix));
+      name = (char*) dup.chars;
+    }
+  }
+  
   VarScope *sc = calloc(1, sizeof(VarScope));
   hashmap_put(&scope->vars, name, sc);
   return sc;
@@ -3140,6 +3264,8 @@ static Node *primary(Token **rest, Token *tok) {
   }
 
   if (tok->kind == TK_IDENT) {
+    // TODO here ident is found, check against namprefixes
+    
     // Variable or enum constant
     VarScope *sc = find_var(tok);
     *rest = tok->next;
@@ -3386,25 +3512,11 @@ static void scan_globals(void) {
   globals = head.next;
 }
 
-void expect_tk_kind(Token *tok, TokenKind kind)
-{
-  if(tok->kind != kind)
-  {
-    error_tok(tok, "Expected token %s, but got %s", token_kind_str[kind], token_kind_str[tok->kind]);
-  }
-}
-
 static void declare_builtin_functions(void) {
   Type *ty = func_type(pointer_to(ty_void));
   ty->params = copy_type(ty_int);
   builtin_alloca = new_gvar("alloca", ty);
   builtin_alloca->is_definition = false;
-}
-
-FXS_StrView strvtok(Token *tok)
-{
-  FXS_StrView v = {.chars = (unsigned char*) tok->loc, .len = tok->len};
-  return v;
 }
 
 Nameprefix *get_np(Nameprefix *parent, FXS_StrView np)
@@ -3513,10 +3625,6 @@ Nameprefix *create_np(Nameprefix *parent, FXS_StrView name)
   return new_np;
 }
 
-FXS_StrView unquote(FXS_StrView s)
-{
-  return fxs_strv(s, 1, s.len - 1);
-}
 
 Token *parse_np(Token *tok)
 {

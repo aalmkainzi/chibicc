@@ -18,8 +18,6 @@
 #include <time.h>
 #include <unistd.h>
 
-// #define FXS_SHORT_NAMES
-#include "fxs.h"
 
 #define MAX(x, y) ((x) < (y) ? (y) : (x))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
