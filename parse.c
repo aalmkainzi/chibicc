@@ -19,6 +19,7 @@
 #include "chibicc.h"
 #include "stc/common.h"
 #include "fxs.h"
+#include <float.h>
 #include <stdlib.h>
 
 #define T SViews, FXS_StrView
@@ -175,7 +176,7 @@ static Node *current_switch;
 
 static Obj *builtin_alloca;
 
-static bool is_typename(Token *tok);
+static bool is_typename(Token *tok, Token **after);
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr);
 static Type *typename(Token **rest, Token *tok);
 static Type *enum_specifier(Token **rest, Token *tok);
@@ -270,27 +271,92 @@ Nameprefix *get_nested_np(Nameprefix *parent, FXS_StrView nested_np_name)
   return NULL;
 }
 
-// example of input:
-// A::B::var means what should be passed is {"A", "B"}, and it returns the nameprefix A::B
-static Nameprefix *get_np_from_access(SViews *access)
+static Nameprefix *get_np_from_access_starting_from(Nameprefix *starting_from, SViews access, NameprefixEntry **entry_ref)
 {
-  // TODO call get_nested_np starting from current np of apply-prefix scope, moving up to find the entire access chain
+  Nameprefix *np = starting_from;
+  while(np)
+  {
+    for(c_each(ent, NPVec, np->nested_entries))
+    {
+      if(fxs_equal(ent.ref[0]->name, access.data[0]))
+      {
+        if(access.size > 1)
+        {
+          access.size -= 1;
+          access.data += 1;
+          Nameprefix *rest_found = get_np_from_access_starting_from(ent.ref[0], access, entry_ref);
+          if(rest_found)
+          {
+            return rest_found;
+          }
+          else
+          {
+            access.size += 1;
+            access.data -= 1;
+          }
+        }
+        else
+        {
+          Nameprefix *found = ent.ref[0];
+          
+          for(c_each(var_ent, NPEntries, found->entries))
+          {
+            if(var_ent.ref[0].is_tag == entry_ref[0]->is_tag)
+            {
+              if((entry_ref[0]->name.chars != NULL && fxs_equal(var_ent.ref[0].name, entry_ref[0]->name)))
+              {
+                *entry_ref = var_ent.ref;
+              }
+              return found;
+            }
+          }
+          return NULL;
+        }
+      }
+    }
+    
+    np = np->parent;
+  }
 }
 
-// Find a variable by name.
-static VarScope *find_var(Token *tok, Token **next) {
-  // TODO What we should do is check for available names in current np
-  // and also check for np access
+// example of input:
+// A::B::var means what should be passed is {"A", "B"}, and it returns the nameprefix A::B
+static Nameprefix *get_np_from_access(SViews access, NameprefixEntry **entry_ref)
+{
+  // TODO call get_nested_np starting from current np of apply-prefix scope, moving up to find the entire access chain
   
-  FXS_StrView var_name = strvtok(tok->next);
-  bool np_access = fxs_equal(var_name, "::");
+  if(!np_scope_stack->is_capture)
+  {
+    Nameprefix *np = np_scope_stack->scope.apply_scope.np;
+    Nameprefix *found = get_np_from_access_starting_from(np, access, entry_ref);
+    if(found)
+      return found;
+  }
+  
+  for(c_each(np_it, NPVec, outer_nps))
+  {
+    Nameprefix *found = get_np_from_access_starting_from(np_it.ref[0], access, entry_ref);
+    if(found)
+    {
+      return found;
+    }
+  }
+  
+  return NULL;
+}
+
+static void *find_ident(Token *tok, Token **after, bool is_tag)
+{
+  bool np_access = fxs_equal(strvtok(tok->next), "::");
   
   if(!np_access)
   {
+    *after = tok->next;
+    
     Scope *found_in = NULL;
     VarScope *ret = NULL;
     for (found_in = scope; found_in; found_in = found_in->next) {
-      VarScope *sc2 = hashmap_get2(&found_in->vars, tok->loc, tok->len);
+      VarScope *sc2 = hashmap_get2(is_tag ? &found_in->tags : &found_in->vars, tok->loc, tok->len);
       if (sc2)
       {
         ret = sc2;
@@ -303,14 +369,14 @@ static VarScope *find_var(Token *tok, Token **next) {
       return ret;
     }
     
-    if(!np_scope_stack->is_capture)
+    if(np_scope_stack && !np_scope_stack->is_capture)
     {
       Nameprefix *np = np_scope_stack->scope.apply_scope.np;
       while(np)
       {
         for(c_each(ent, NPEntries, np->entries))
         {
-          if(!ent.ref->is_tag && fxs_equal(ent.ref->name, var_name))
+          if(ent.ref->is_tag == is_tag && fxs_equal(ent.ref->name, strvtok(tok)))
           {
             ret = ent.ref->entry.var;
             goto found;
@@ -322,7 +388,6 @@ static VarScope *find_var(Token *tok, Token **next) {
       
       found:;
     }
-    
     return ret;
   }
   else
@@ -340,23 +405,32 @@ static VarScope *find_var(Token *tok, Token **next) {
       next_tok = strvtok(tok->next);
     }
     
-    if(!np_scope_stack->is_capture) // inside an apply-prefix scope
+    expect_tk_kind(tok, TK_IDENT); // the var name
+    
+    NameprefixEntry arg = {.name = strvtok(tok), .is_tag = is_tag};
+    NameprefixEntry *entry = &arg;
+    Nameprefix *np = get_np_from_access(nps_accessed, &entry);
+    
+    *after = tok->next;
+    
+    // both entry.var and entry.tag are the same pointer in memory, so checking one is fine
+    if(entry->entry.var != NULL)
     {
-      
+      // both are the same pointer, so its fine. no need to check is_tag
+      return entry->entry.var;
     }
   }
   
   return NULL;
 }
 
-// TODO should also check nameprefixes here
-static Type *find_tag(Token *tok) {
-  for (Scope *sc = scope; sc; sc = sc->next) {
-    Type *ty = hashmap_get2(&sc->tags, tok->loc, tok->len);
-    if (ty)
-      return ty;
-  }
-  return NULL;
+// Find a variable by name.
+static VarScope *find_var(Token *tok, Token **after) {
+  return find_ident(tok, after, false);
+}
+
+static Type *find_tag(Token *tok, Token **after) {
+  return find_ident(tok, after, true);
 }
 
 static Node *new_node(NodeKind kind, Token *tok) {
@@ -529,17 +603,63 @@ static char *get_ident(Token *tok) {
   return strndup(tok->loc, tok->len);
 }
 
-static Type *find_typedef(Token *tok) {
+static Type *find_typedef(Token *tok, Token **after) {
   if (tok->kind == TK_IDENT) {
-    VarScope *sc = find_var(tok);
+    VarScope *sc = find_var(tok, after);
     if (sc)
       return sc->type_def;
   }
   return NULL;
 }
 
+static NameprefixEntry *push_np_tag(Nameprefix *np, Type *tag, FXS_StrView name)
+{
+  NameprefixEntry ent = {
+    .is_tag = true,
+    .entry.tag = tag,
+    .name = name
+  };
+  return NPEntries_push(&np->entries, ent);
+}
+
+static NameprefixEntry *push_np_var(Nameprefix *np, VarScope *var, FXS_StrView name)
+{
+  NameprefixEntry ent = {
+    .is_tag = false,
+    .entry.var = var,
+    .name = name
+  };
+  return NPEntries_push(&np->entries, ent);
+}
+
 static void push_tag_scope(Token *tok, Type *ty) {
-  hashmap_put2(&scope->tags, tok->loc, tok->len, ty);
+  if(scope->next == NULL && np_scope_stack != NULL) // global scope
+  {
+    // TODO prefix if in apply-prefix scope
+    // or if in capture-prefix, then consider it for all upper capture scopes
+    
+    if(np_scope_stack->is_capture)
+    {
+      
+    }
+    else
+    {
+      Nameprefix *np = np_scope_stack->scope.apply_scope.np;
+      
+      FXS_StrView prefix = unquote(np->prefix);
+      
+      FXS_DStr new_name = fxs_dup(strvtok(tok));
+      fxs_prepend(&new_name, prefix);
+      
+      Type *new_tag = hashmap_put2(&scope->tags, (char*) new_name.chars, new_name.len, ty).val;
+      
+      push_np_tag(np, new_tag, fxs_strv(new_name));
+    }
+  }
+  else
+  {
+    hashmap_put2(&scope->tags, tok->loc, tok->len, ty);
+  }
 }
 
 // declspec = ("void" | "_Bool" | "char" | "short" | "int" | "long"
@@ -584,8 +704,9 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
   Type *ty = ty_int;
   int counter = 0;
   bool is_atomic = false;
-
-  while (is_typename(tok)) {
+  
+  Token *after;
+  while (is_typename(tok, &after)) {
     // Handle storage class specifiers.
     if (equal(tok, "typedef") || equal(tok, "static") || equal(tok, "extern") ||
         equal(tok, "inline") || equal(tok, "_Thread_local") || equal(tok, "__thread")) {
@@ -607,7 +728,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
           attr->is_static + attr->is_extern + attr->is_inline + attr->is_tls > 1)
         error_tok(tok, "typedef may not be used together with static,"
                   " extern, inline, __thread or _Thread_local");
-      tok = tok->next;
+      tok = after;
       continue;
     }
 
@@ -632,8 +753,9 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       if (!attr)
         error_tok(tok, "_Alignas is not allowed in this context");
       tok = skip(tok->next, "(");
-
-      if (is_typename(tok))
+      
+      Token *after;
+      if (is_typename(tok, &after))
         attr->align = typename(&tok, tok)->align;
       else
         attr->align = const_expr(&tok, tok);
@@ -642,7 +764,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     }
 
     // Handle user-defined types.
-    Type *ty2 = find_typedef(tok);
+    Token *after;
+    Type *ty2 = find_typedef(tok, &after);
     if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum") ||
         equal(tok, "typeof") || ty2) {
       if (counter)
@@ -658,7 +781,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
         ty = typeof_specifier(&tok, tok->next);
       } else {
         ty = ty2;
-        tok = tok->next;
+        tok = after;
       }
 
       counter += OTHER;
@@ -943,7 +1066,7 @@ static Type *enum_specifier(Token **rest, Token *tok) {
   }
 
   if (tag && !equal(tok, "{")) {
-    Type *ty = find_tag(tag);
+    Type *ty = find_tag(tag, &tok);
     if (!ty)
       error_tok(tag, "unknown enum type");
     if (ty->kind != TY_ENUM)
@@ -982,9 +1105,11 @@ static Type *typeof_specifier(Token **rest, Token *tok) {
   tok = skip(tok, "(");
 
   Type *ty;
-  if (is_typename(tok)) {
-    ty = typename(&tok, tok);
+  Token *after = NULL;
+  if (is_typename(tok, &after)) {
+    ty = typename(&tok, tok); // this has its own after assignments, probably fine
   } else {
+    // assert(after == NULL);
     Node *node = expr(&tok, tok);
     add_type(node);
     ty = node->ty;
@@ -1678,7 +1803,7 @@ static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
 }
 
 // Returns true if a given token represents a type.
-static bool is_typename(Token *tok) {
+static bool is_typename(Token *tok, Token **after) {
   static HashMap map;
 
   if (map.capacity == 0) {
@@ -1693,8 +1818,9 @@ static bool is_typename(Token *tok) {
     for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
       hashmap_put(&map, kw[i], (void *)1);
   }
-
-  return hashmap_get2(&map, tok->loc, tok->len) || find_typedef(tok);
+  
+  *after = tok->next;
+  return hashmap_get2(&map, tok->loc, tok->len) || find_typedef(tok, after);
 }
 
 // asm-stmt = "asm" ("volatile" | "inline")* "(" string-literal ")"
@@ -1827,7 +1953,8 @@ static Node *stmt(Token **rest, Token *tok) {
     brk_label = node->brk_label = new_unique_name();
     cont_label = node->cont_label = new_unique_name();
 
-    if (is_typename(tok)) {
+    Token *after = NULL;
+    if (is_typename(tok, &after)) {
       Type *basety = declspec(&tok, tok, NULL);
       node->init = declaration(&tok, tok, basety, NULL);
     } else {
@@ -1952,7 +2079,8 @@ static Node *compound_stmt(Token **rest, Token *tok) {
   enter_scope();
 
   while (!equal(tok, "}")) {
-    if (is_typename(tok) && !equal(tok->next, ":")) {
+    Token *after = NULL;
+    if (is_typename(tok, &after) && !equal(tok->next, ":")) {
       VarAttr attr = {};
       Type *basety = declspec(&tok, tok, &attr);
 
@@ -1973,6 +2101,7 @@ static Node *compound_stmt(Token **rest, Token *tok) {
 
       cur = cur->next = declaration(&tok, tok, basety, &attr);
     } else {
+      // assert(after == NULL);
       cur = cur->next = stmt(&tok, tok);
     }
     add_type(cur);
@@ -2648,7 +2777,8 @@ static Node *mul(Token **rest, Token *tok) {
 
 // cast = "(" type-name ")" cast | unary
 static Node *cast(Token **rest, Token *tok) {
-  if (equal(tok, "(") && is_typename(tok->next)) {
+  Token *after = NULL;
+  if (equal(tok, "(") && is_typename(tok->next, &after)) {
     Token *start = tok;
     Type *ty = typename(&tok, tok->next);
     tok = skip(tok, ")");
@@ -2821,6 +2951,11 @@ static Type *struct_union_decl(Token **rest, Token *tok) {
   // Read a tag.
   Token *tag = NULL;
   if (tok->kind == TK_IDENT) {
+    // TODO here handle adding tag to the current nameprefix
+    // (if apply-prefix, then add it and add prefix to its tag)
+    // (if capture-prefix, go up the stack and consider it for every capture-prefix scope)
+    // or maybe not here, maybe in push_tag_scope (I think here because of `Type *ty2 = find_tag(tag);`)
+    // actually definetly here, because we are expecting '{' in a few tokens ahead (NO WE ARENT, THIS IS A DECL)
     tag = tok;
     tok = tok->next;
   }
@@ -2828,7 +2963,8 @@ static Type *struct_union_decl(Token **rest, Token *tok) {
   if (tag && !equal(tok, "{")) {
     *rest = tok;
 
-    Type *ty2 = find_tag(tag);
+    Type *ty2 = find_tag(tag, &tok); // here :: access should not be allowed because this is a decl not a usage (another param? flags?)
+    *rest = tok;
     if (ty2)
       return ty2;
 
@@ -2989,7 +3125,8 @@ static Node *new_inc_dec(Node *node, Token *tok, int addend) {
 //              | "++"
 //              | "--"
 static Node *postfix(Token **rest, Token *tok) {
-  if (equal(tok, "(") && is_typename(tok->next)) {
+  Token *after = NULL;
+  if (equal(tok, "(") && is_typename(tok->next, &after)) {
     // Compound literal
     Token *start = tok;
     Type *ty = typename(&tok, tok->next);
@@ -3181,7 +3318,8 @@ static Node *primary(Token **rest, Token *tok) {
     return node;
   }
 
-  if (equal(tok, "sizeof") && equal(tok->next, "(") && is_typename(tok->next->next)) {
+  Token *after = NULL;
+  if (equal(tok, "sizeof") && equal(tok->next, "(") && is_typename(tok->next->next, &after)) {
     Type *ty = typename(&tok, tok->next->next);
     *rest = skip(tok, ")");
 
@@ -3196,7 +3334,9 @@ static Node *primary(Token **rest, Token *tok) {
 
     return new_ulong(ty->size, start);
   }
-
+  
+  // assert(after == NULL);
+  
   if (equal(tok, "sizeof")) {
     Node *node = unary(rest, tok->next);
     add_type(node);
@@ -3204,8 +3344,10 @@ static Node *primary(Token **rest, Token *tok) {
       return new_var_node(node->ty->vla_size, tok);
     return new_ulong(node->ty->size, tok);
   }
-
-  if (equal(tok, "_Alignof") && equal(tok->next, "(") && is_typename(tok->next->next)) {
+  
+  // assert(after == NULL);
+  
+  if (equal(tok, "_Alignof") && equal(tok->next, "(") && is_typename(tok->next->next, &after)) {
     Type *ty = typename(&tok, tok->next->next);
     *rest = skip(tok, ")");
     return new_ulong(ty->align, tok);
@@ -3267,8 +3409,9 @@ static Node *primary(Token **rest, Token *tok) {
     // TODO here ident is found, check against namprefixes
     
     // Variable or enum constant
-    VarScope *sc = find_var(tok);
-    *rest = tok->next;
+    Token *after = NULL;
+    VarScope *sc = find_var(tok, &after);
+    *rest = after;
 
     // For "static inline" function
     if (sc && sc->var && sc->var->is_function) {
@@ -3285,9 +3428,9 @@ static Node *primary(Token **rest, Token *tok) {
         return new_num(sc->enum_val, tok);
     }
 
-    if (equal(tok->next, "("))
-      error_tok(tok, "implicit declaration of a function");
-    error_tok(tok, "undefined variable");
+    if (equal(after, "("))
+      error_tok(after, "implicit declaration of a function");
+    error_tok(after, "undefined variable");
   }
 
   if (tok->kind == TK_STR) {

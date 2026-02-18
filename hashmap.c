@@ -114,13 +114,14 @@ void *hashmap_get2(HashMap *map, char *key, int keylen) {
   return ent ? ent->val : NULL;
 }
 
-void hashmap_put(HashMap *map, char *key, void *val) {
-   hashmap_put2(map, key, strlen(key), val);
+HashEntry hashmap_put(HashMap *map, char *key, void *val) {
+   return hashmap_put2(map, key, strlen(key), val);
 }
 
-void hashmap_put2(HashMap *map, char *key, int keylen, void *val) {
+HashEntry hashmap_put2(HashMap *map, char *key, int keylen, void *val) {
   HashEntry *ent = get_or_insert_entry(map, key, keylen);
   ent->val = val;
+  return ent;
 }
 
 void hashmap_delete(HashMap *map, char *key) {
