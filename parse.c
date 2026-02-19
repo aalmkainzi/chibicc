@@ -18,11 +18,14 @@
 
 #include "chibicc.h"
 #include "stc/common.h"
-#include "fxs.h"
+#include <assert.h>
+#define SGS_SHORT_NAMES
+#include "sgs.h"
+#undef println
 #include <float.h>
 #include <stdlib.h>
 
-#define T SViews, FXS_StrView
+#define T SViews, StrView
 #include "stc/vec.h"
 
 struct Nameprefix;
@@ -99,7 +102,7 @@ struct InitDesg {
 
 typedef struct NameprefixEntry
 {
-  FXS_StrView name;
+  StrView name;
   
   bool is_tag;
   union {
@@ -116,8 +119,8 @@ struct Nameprefix
 {
   struct Nameprefix *parent;
   
-  FXS_StrView name;
-  FXS_StrView prefix;
+  StrView name;
+  StrView prefix;
   NPEntries entries;
   NPVec nested_entries;
 };
@@ -226,14 +229,18 @@ static bool is_function(Token *tok);
 static Token *function(Token *tok, Type *basety, VarAttr *attr);
 static Token *global_variable(Token *tok, Type *basety, VarAttr *attr);
 
-FXS_StrView unquote(FXS_StrView s)
+static DStr get_np_full_name(Nameprefix *np);
+static void consider_ident_for_all_capture_prefix_scopes(StrView tokv, void *k, bool is_tag);
+static NameprefixEntry *push_np_var(Nameprefix *np, VarScope *var, StrView name);
+
+StrView unquote(StrView s)
 {
-  return fxs_strv(s, 1, s.len - 1);
+  return strv(s, 1, s.len - 1);
 }
 
-FXS_StrView strvtok(Token *tok)
+StrView strvtok(Token *tok)
 {
-  FXS_StrView v = {.chars = (unsigned char*) tok->loc, .len = tok->len};
+  StrView v = {.chars = (unsigned char*) tok->loc, .len = tok->len};
   return v;
 }
 
@@ -259,11 +266,11 @@ static void leave_scope(void) {
   scope = scope->next;
 }
 
-Nameprefix *get_nested_np(Nameprefix *parent, FXS_StrView nested_np_name)
+Nameprefix *get_nested_np(Nameprefix *parent, StrView nested_np_name)
 {
   for(c_each(np_it, NPVec, parent->nested_entries))
   {
-    if(fxs_equal(np_it.ref[0]->name, nested_np_name))
+    if(sgs_equal(np_it.ref[0]->name, nested_np_name))
     {
       return np_it.ref[0];
     }
@@ -278,7 +285,7 @@ static Nameprefix *get_np_from_access_starting_from(Nameprefix *starting_from, S
   {
     for(c_each(ent, NPVec, np->nested_entries))
     {
-      if(fxs_equal(ent.ref[0]->name, access.data[0]))
+      if(sgs_equal(ent.ref[0]->name, access.data[0]))
       {
         if(access.size > 1)
         {
@@ -303,11 +310,11 @@ static Nameprefix *get_np_from_access_starting_from(Nameprefix *starting_from, S
           {
             if(var_ent.ref[0].is_tag == entry_ref[0]->is_tag)
             {
-              if((entry_ref[0]->name.chars != NULL && fxs_equal(var_ent.ref[0].name, entry_ref[0]->name)))
+              if((entry_ref[0]->name.chars != NULL && sgs_equal(var_ent.ref[0].name, entry_ref[0]->name)))
               {
                 *entry_ref = var_ent.ref;
+                return found;
               }
-              return found;
             }
           }
           return NULL;
@@ -317,6 +324,45 @@ static Nameprefix *get_np_from_access_starting_from(Nameprefix *starting_from, S
     
     np = np->parent;
   }
+  
+  for(c_each(ent, NPVec, outer_nps))
+  {
+    if(sgs_equal(ent.ref[0]->name, access.data[0]))
+    {
+      if(access.size > 1)
+      {
+        access.size -= 1;
+        access.data += 1;
+        Nameprefix *rest_found = get_np_from_access_starting_from(ent.ref[0], access, entry_ref);
+        if(rest_found)
+        {
+          return rest_found;
+        }
+        else
+        {
+          access.size += 1;
+          access.data -= 1;
+        }
+      }
+      else
+      {
+        Nameprefix *found = ent.ref[0];
+        
+        for(c_each(var_ent, NPEntries, found->entries))
+        {
+          if(var_ent.ref[0].is_tag == entry_ref[0]->is_tag)
+          {
+            if((entry_ref[0]->name.chars != NULL && sgs_equal(var_ent.ref[0].name, entry_ref[0]->name)))
+            {
+              *entry_ref = var_ent.ref;
+              return found;
+            }
+          }
+        }
+        return NULL;
+      }
+    }
+  }
 }
 
 // example of input:
@@ -325,21 +371,18 @@ static Nameprefix *get_np_from_access(SViews access, NameprefixEntry **entry_ref
 {
   // TODO call get_nested_np starting from current np of apply-prefix scope, moving up to find the entire access chain
   
-  if(!np_scope_stack->is_capture)
+  if(np_scope_stack != NULL && !np_scope_stack->is_capture)
   {
     Nameprefix *np = np_scope_stack->scope.apply_scope.np;
     Nameprefix *found = get_np_from_access_starting_from(np, access, entry_ref);
     if(found)
       return found;
   }
-  
-  for(c_each(np_it, NPVec, outer_nps))
+  else
   {
-    Nameprefix *found = get_np_from_access_starting_from(np_it.ref[0], access, entry_ref);
+    Nameprefix *found = get_np_from_access_starting_from(NULL, access, entry_ref);
     if(found)
-    {
       return found;
-    }
   }
   
   return NULL;
@@ -347,7 +390,7 @@ static Nameprefix *get_np_from_access(SViews access, NameprefixEntry **entry_ref
 
 static void *find_ident(Token *tok, Token **after, bool is_tag)
 {
-  bool np_access = fxs_equal(strvtok(tok->next), "::");
+  bool np_access = sgs_equal(strvtok(tok->next), "::");
   
   if(!np_access)
   {
@@ -376,7 +419,7 @@ static void *find_ident(Token *tok, Token **after, bool is_tag)
       {
         for(c_each(ent, NPEntries, np->entries))
         {
-          if(ent.ref->is_tag == is_tag && fxs_equal(ent.ref->name, strvtok(tok)))
+          if(ent.ref->is_tag == is_tag && sgs_equal(ent.ref->name, strvtok(tok)))
           {
             ret = ent.ref->entry.var;
             goto found;
@@ -397,8 +440,8 @@ static void *find_ident(Token *tok, Token **after, bool is_tag)
     
     SViews nps_accessed = SViews_init();
     
-    FXS_StrView next_tok = strvtok(tok->next);
-    while(fxs_equal(next_tok, "::"))
+    StrView next_tok = strvtok(tok->next);
+    while(sgs_equal(next_tok, "::"))
     {
       SViews_push(&nps_accessed, strvtok(tok));
       tok = tok->next->next;
@@ -497,23 +540,72 @@ Node *new_cast(Node *expr, Type *ty) {
 }
 
 static VarScope *push_scope(char *name) {
-  if (scope->next == NULL) // file scope
+  if (scope->next == NULL && np_scope_stack != NULL) // file scope
   {
     // here we should check the current apply-prefix scope, and apply prefix to the name
-    if(np_scope_stack != NULL && !np_scope_stack->is_capture)
+    // TODO also shouldnt we add it the np? and check if captuer and recursively add?
+    if(np_scope_stack->is_capture)
+    {
+      VarScope *sc = calloc(1, sizeof(VarScope));
+      hashmap_put(&scope->vars, name, sc);
+      
+      consider_ident_for_all_capture_prefix_scopes(strv(name), sc, false);
+      
+      return sc;
+    }
+    else
     {
       ApplyPrefixScope *apply_scope = &np_scope_stack->scope.apply_scope;
       
-      FXS_StrView prefix = apply_scope->np->prefix;
-      FXS_DStr dup = fxs_dup(name);
-      fxs_prepend(&dup, unquote(prefix));
-      name = (char*) dup.chars;
+      StrView prefix = apply_scope->np->prefix;
+      DStr dup = sgs_dup(name);
+      sgs_prepend(&dup, unquote(prefix));
+      
+      VarScope *sc = calloc(1, sizeof(VarScope));
+      hashmap_put(&scope->vars, (char*) dup.chars, sc);
+      
+      push_np_var(apply_scope->np, sc, strv(name));
+      
+      return sc;
     }
   }
+  else
+  {
+    VarScope *sc = calloc(1, sizeof(VarScope));
+    hashmap_put(&scope->vars, name, sc);
+    return sc;
+  }
   
-  VarScope *sc = calloc(1, sizeof(VarScope));
-  hashmap_put(&scope->vars, name, sc);
-  return sc;
+/*
+  if(scope->next == NULL && np_scope_stack != NULL) // global scope
+  {
+    // TODO prefix if in apply-prefix scope
+    // or if in capture-prefix, then consider it for all upper capture scopes
+    
+    if(np_scope_stack->is_capture)
+    {
+      consider_ident_for_all_capture_prefix_scopes(tok, ty, true);
+    }
+    else
+    {
+      Nameprefix *np = np_scope_stack->scope.apply_scope.np;
+      
+      StrView prefix = unquote(np->prefix);
+      
+      DStr new_name = sgs_dup(strvtok(tok));
+      sgs_prepend(&new_name, prefix);
+      
+      // is_tag used here:
+      Type *new_tag = hashmap_put2(&scope->tags, (char*) new_name.chars, new_name.len, ty)->val;
+      
+      push_np_tag(np, new_tag, strv(new_name));
+    }
+  }
+  else
+  {
+    hashmap_put2(&scope->tags, tok->loc, tok->len, ty);
+  }
+*/
 }
 
 static Initializer *new_initializer(Type *ty, bool is_flexible) {
@@ -612,7 +704,7 @@ static Type *find_typedef(Token *tok, Token **after) {
   return NULL;
 }
 
-static NameprefixEntry *push_np_tag(Nameprefix *np, Type *tag, FXS_StrView name)
+static NameprefixEntry *push_np_tag(Nameprefix *np, Type *tag, StrView name)
 {
   NameprefixEntry ent = {
     .is_tag = true,
@@ -622,7 +714,7 @@ static NameprefixEntry *push_np_tag(Nameprefix *np, Type *tag, FXS_StrView name)
   return NPEntries_push(&np->entries, ent);
 }
 
-static NameprefixEntry *push_np_var(Nameprefix *np, VarScope *var, FXS_StrView name)
+static NameprefixEntry *push_np_var(Nameprefix *np, VarScope *var, StrView name)
 {
   NameprefixEntry ent = {
     .is_tag = false,
@@ -630,6 +722,61 @@ static NameprefixEntry *push_np_var(Nameprefix *np, VarScope *var, FXS_StrView n
     .name = name
   };
   return NPEntries_push(&np->entries, ent);
+}
+
+static NameprefixEntry *np_contains(Nameprefix *np, StrView ident, bool is_tag)
+{
+  for(c_each(ent, NPEntries, np->entries))
+  {
+    if(ent.ref->is_tag == is_tag)
+    {
+      if(sgs_equal(ent.ref->name, ident))
+        return ent.ref;
+    }
+  }
+  return NULL;
+}
+
+static void consider_ident_for_all_capture_prefix_scopes(StrView tokv, void *k, bool is_tag)
+{
+  assert(np_scope_stack->is_capture);
+  
+  NameprefixScope *np_scope = np_scope_stack;
+  
+  void *new_ident = hashmap_put2(is_tag ? &scope->tags : &scope->vars, (char*) tokv.chars, tokv.len, k)->val;
+  
+  while(np_scope != NULL)
+  {
+    if(!np_scope->is_capture)
+      continue;
+    CapturePrefixScope *sc = &np_scope->scope.capture_scope;
+    
+    for(c_each(mr, CapturePrefixScope, *sc))
+    {
+      Nameprefix *np = mr.ref->np;
+      StrView prefix = unquote(np->prefix);
+      if(
+        sgs_starts_with(tokv, prefix) &&
+        tokv.len > prefix.len         &&
+        (isalpha(tokv.chars[prefix.len]) || tokv.chars[prefix.len] == '_')
+      )
+      {
+        StrView unprefixed = strv(tokv, prefix.len);
+        NameprefixEntry *contained = np_contains(np, unprefixed, true);
+        if(contained && (contained->is_tag == is_tag) && *(void**)&contained->entry != k)
+        {
+          DStr full_name = get_np_full_name(np);
+          sgs_fprintln(stderr, "Nameprefix ", full_name, " already contains tag ", tokv);
+          exit(1);
+        }
+        
+        is_tag ? push_np_tag(np, new_ident, unprefixed) : push_np_var(np, new_ident, unprefixed);
+      }
+    }
+    
+    np_scope = np_scope->up;
+  }
+  
 }
 
 static void push_tag_scope(Token *tok, Type *ty) {
@@ -640,20 +787,21 @@ static void push_tag_scope(Token *tok, Type *ty) {
     
     if(np_scope_stack->is_capture)
     {
-      
+      consider_ident_for_all_capture_prefix_scopes(strvtok(tok), ty, true);
     }
     else
     {
       Nameprefix *np = np_scope_stack->scope.apply_scope.np;
       
-      FXS_StrView prefix = unquote(np->prefix);
+      StrView prefix = unquote(np->prefix);
       
-      FXS_DStr new_name = fxs_dup(strvtok(tok));
-      fxs_prepend(&new_name, prefix);
+      DStr new_name = sgs_dup(strvtok(tok));
+      sgs_prepend(&new_name, prefix);
       
-      Type *new_tag = hashmap_put2(&scope->tags, (char*) new_name.chars, new_name.len, ty).val;
+      // is_tag used here:
+      Type *new_tag = hashmap_put2(&scope->tags, (char*) new_name.chars, new_name.len, ty)->val;
       
-      push_np_tag(np, new_tag, fxs_strv(new_name));
+      push_np_tag(np, new_tag, strv(new_name));
     }
   }
   else
@@ -3662,7 +3810,7 @@ static void declare_builtin_functions(void) {
   builtin_alloca->is_definition = false;
 }
 
-Nameprefix *get_np(Nameprefix *parent, FXS_StrView np)
+Nameprefix *get_np(Nameprefix *parent, StrView np)
 {
   NPVec *vec = &outer_nps;
   if(parent != NULL)
@@ -3672,7 +3820,7 @@ Nameprefix *get_np(Nameprefix *parent, FXS_StrView np)
   
   for(c_each(it, NPVec, *vec))
   {
-    if(fxs_equal(it.ref[0]->name, np))
+    if(sgs_equal(it.ref[0]->name, np))
     {
       return it.ref[0];
     }
@@ -3680,33 +3828,33 @@ Nameprefix *get_np(Nameprefix *parent, FXS_StrView np)
   return NULL;
 }
 
-FXS_DStr get_np_full_name(Nameprefix *np)
+static DStr get_np_full_name(Nameprefix *np)
 {
-  FXS_DStr full_np_name = fxs_dstr_init();
-  fxs_append(&full_np_name, np->name);
+  DStr full_np_name = sgs_dstr_init();
+  sgs_append(&full_np_name, np->name);
   
   Nameprefix *parent_iter = np->parent;
   while(parent_iter)
   {
-    fxs_prepend(&full_np_name, "::");
-    fxs_prepend(&full_np_name, parent_iter->name);
+    sgs_prepend(&full_np_name, "::");
+    sgs_prepend(&full_np_name, parent_iter->name);
     parent_iter = parent_iter->parent;
   }
   
   return full_np_name;
 }
 
-void np_not_exist_error(Nameprefix *in_scope_of, FXS_StrView name)
+void np_not_exist_error(Nameprefix *in_scope_of, StrView name)
 {
   if(in_scope_of == NULL)
   {
-    fxs_fprintln(stderr, "_Nameprefix ", name ," doesn't exist");
+    sgs_fprintln(stderr, "_Nameprefix ", name ," doesn't exist");
   }
   else
   {
-    FXS_DStr full_name = get_np_full_name(in_scope_of);
-    fxs_fprintln(stderr, "_Nameprefix ", name ," doesn't exist in ", full_name);
-    fxs_dstr_deinit(&full_name);
+    DStr full_name = get_np_full_name(in_scope_of);
+    sgs_fprintln(stderr, "_Nameprefix ", name ," doesn't exist in ", full_name);
+    sgs_dstr_deinit(&full_name);
   }
   exit(1);
 }
@@ -3717,7 +3865,7 @@ Nameprefix *get_np_by_name(Nameprefix *in_scope_of, Token **tokp)
 {
   Token *tok = *tokp;
   expect_tk_kind(tok, TK_IDENT);
-  FXS_StrView np_name = strvtok(tok);
+  StrView np_name = strvtok(tok);
   tok = tok->next;
   Nameprefix *np = get_np(in_scope_of, np_name);
   
@@ -3727,11 +3875,11 @@ Nameprefix *get_np_by_name(Nameprefix *in_scope_of, Token **tokp)
     np_not_exist_error(in_scope_of, np_name);
   }
   
-  while(fxs_equal(strvtok(tok), "::"))
+  while(sgs_equal(strvtok(tok), "::"))
   {
     tok = skip(tok, "::");
     expect_tk_kind(tok, TK_IDENT);
-    FXS_StrView child_name = strvtok(tok);
+    StrView child_name = strvtok(tok);
     tok = tok->next;
     
     Nameprefix *child = get_np(np, child_name);
@@ -3748,11 +3896,11 @@ Nameprefix *get_np_by_name(Nameprefix *in_scope_of, Token **tokp)
   return np;
 }
 
-Nameprefix *create_np(Nameprefix *parent, FXS_StrView name)
+Nameprefix *create_np(Nameprefix *parent, StrView name)
 {
   Nameprefix *new_np = calloc(1, sizeof(Nameprefix));
   new_np->parent = parent;
-  new_np->prefix = (FXS_StrView){0};
+  new_np->prefix = (StrView){0};
   new_np->name = name;
   new_np->entries = NPEntries_init();
   new_np->nested_entries = NPVec_init();
@@ -3777,7 +3925,7 @@ Token *parse_np(Token *tok)
   tok = skip(tok, "_Nameprefix");
   expect_tk_kind(tok, TK_IDENT);
   
-  FXS_StrView npname = strvtok(tok);
+  StrView npname = strvtok(tok);
   
   Nameprefix *parent = NULL;
   Nameprefix *np = get_np(parent, npname);
@@ -3807,11 +3955,11 @@ Token *parse_np(Token *tok)
   // re-decl of _Nameprefix is allowed ONLY IF it's identical to previous decl
   if(np->prefix.chars != NULL)
   {
-    if(!fxs_equal(np->prefix, strvtok(tok)))
+    if(!sgs_equal(np->prefix, strvtok(tok)))
     {
-      FXS_DStr full_name = get_np_full_name(np);
-      fxs_fprintln(stderr, "Redeclaration of _Nameprefix ", full_name, " with a different prefix: ", strvtok(tok), ". Previously declared with: ", np->prefix);
-      fxs_dstr_deinit(&full_name);
+      DStr full_name = get_np_full_name(np);
+      sgs_fprintln(stderr, "Redeclaration of _Nameprefix ", full_name, " with a different prefix: ", strvtok(tok), ". Previously declared with: ", np->prefix);
+      sgs_dstr_deinit(&full_name);
       exit(1);
     }
   }
@@ -3822,17 +3970,17 @@ Token *parse_np(Token *tok)
   
   if(parent != NULL)
   {
-    if(!fxs_starts_with(
+    if(!sgs_starts_with(
         unquote(np->prefix),
         unquote(parent->prefix)
        )
     )
     {
-      FXS_DStr np_full_name = get_np_full_name(np);
+      DStr np_full_name = get_np_full_name(np);
       
-      fxs_fprintln(stderr, "_Nameprefix ", np_full_name, "'s prefix ", np->prefix , " must start with its parent's prefix ", parent->prefix);
+      sgs_fprintln(stderr, "_Nameprefix ", np_full_name, "'s prefix ", np->prefix , " must start with its parent's prefix ", parent->prefix);
       
-      fxs_dstr_deinit(&np_full_name);
+      sgs_dstr_deinit(&np_full_name);
       
       exit(1);
     }
@@ -3847,20 +3995,20 @@ Token *parse_np_scope(Token *tok)
 {
   NameprefixScope *new_scope = calloc(1, sizeof(NameprefixScope));
   
-  FXS_StrView scope_kind = strvtok(tok);
-  if(fxs_equal(scope_kind, "_Capture"))
+  StrView scope_kind = strvtok(tok);
+  if(sgs_equal(scope_kind, "_Capture"))
   {
     new_scope->is_capture = true;
     tok = skip(tok, "_Capture");
   }
-  else if(fxs_equal(scope_kind, "_Apply"))
+  else if(sgs_equal(scope_kind, "_Apply"))
   {
     new_scope->is_capture = false;
     tok = skip(tok, "_Apply");
   }
   else
   {
-    fxs_fprint(stderr, "Expected either _Capture or _Apply, got ", scope_kind);
+    sgs_fprintln(stderr, "Expected either _Capture or _Apply, got ", scope_kind);
     exit(1);
   }
   
@@ -3876,14 +4024,18 @@ Token *parse_np_scope(Token *tok)
     CapturePrefixScopeMapping mapping = {.np = mapped_to_np};
     CapturePrefixScope_push(capture_scope, mapping);
     
-    FXS_StrView tokview = strvtok(tok);
-    while(fxs_equal(tokview, ","))
+    StrView tokview = strvtok(tok);
+    while(sgs_equal(tokview, ","))
     {
       tok = skip(tok, ",");
+      
       Nameprefix *mapped_to_np = get_np_by_name(NULL, &tok);
       CapturePrefixScopeMapping mapping = {.np = mapped_to_np};
       CapturePrefixScope_push(capture_scope, mapping);
+      
+      tokview = strvtok(tok);
     }
+    tok = skip(tok, "{");
   }
   else
   {
@@ -3915,7 +4067,7 @@ Obj *parse(Token *tok) {
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
     
-    if(fxs_equal(strvtok(tok), "}") && np_scope_stack != NULL)
+    if(sgs_equal(strvtok(tok), "}") && np_scope_stack != NULL)
     {
       np_scope_stack = np_scope_stack->up;
       tok = skip(tok, "}");
@@ -3928,7 +4080,7 @@ Obj *parse(Token *tok) {
       continue;
     }
     
-    if(fxs_equal(strvtok(tok), "_Apply") || fxs_equal(strvtok(tok), "_Capture"))
+    if(sgs_equal(strvtok(tok), "_Apply") || sgs_equal(strvtok(tok), "_Capture"))
     {
       tok = parse_np_scope(tok);
       continue;
