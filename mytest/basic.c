@@ -1,49 +1,73 @@
 
-_Nameprefix pt = "pthread_";
-_Nameprefix mem = "mem";
-_Nameprefix str = "str";
+_Nameprefix A = "A__";
+_Nameprefix A::B = "A__B__";
+_Nameprefix C = "C__";
 
-_Capture _Nameprefix
-    pt,
-    mem,
-    str
+
+_Apply _Nameprefix A::B
 {
-    #include <stdio.h>
-    #include <stdlib.h>
-    #include <pthread.h>
-    #include <string.h>
-}
-
-#define NUM_THREADS 4
-
-void* thread_function(void* arg) {
-    int id = *(int*)arg;
-    printf("Hello from thread %d\n", id);
-    return NULL;
-}
-
-int main() {
-    char *str = "hello";
-    char buf[64];
-    str::cpy(buf, str);
-    
-    
-    pt::t threads[NUM_THREADS];
-    int thread_ids[NUM_THREADS];
-    
-    for (int i = 0; i < NUM_THREADS; i++) {
-        thread_ids[i] = i;
+    _Capture _Nameprefix C
+    {
+        int C__baz() { return 100; };
         
-        if (pt::create(&threads[i], NULL, thread_function, &thread_ids[i]) != 0) {
-            perror("pthread_create failed");
-            return 1;
+        _Apply _Nameprefix A
+        {
+            int qux()
+            {
+                return 1;
+            }
+        }
+        
+        _Apply _Nameprefix A::B
+        {
+            int qux()
+            {
+                return 2;
+            }
         }
     }
+    int foo() { return 10; }
+}
+
+_Apply _Nameprefix A
+{
+    int my_cool_var = 69;
+    _Apply _Nameprefix B
+    {
+        int bar()
+        {
+            return 3;
+        }
+    }
+}
+
+_Apply _Nameprefix A
+{
+    struct SS
+    {
+        int i;
+    };
+    typedef int i32;
     
-    for (int i = 0; i < NUM_THREADS; i++) {
-        pt::join(threads[i], NULL);
+    enum Flags2
+    {
+        A2,B2=69,C2
+    }
+}
+
+_Capture _Nameprefix A
+{
+    typedef short A__i16;
+    
+    enum A__Flags
+    {
+        A,B,C
     }
     
-    printf("All threads finished.\n");
-    return 0;
+}
+
+int main()
+{
+    enum A::Flags2 a = A::B2;
+    return a;
 }
