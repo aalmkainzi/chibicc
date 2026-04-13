@@ -724,6 +724,7 @@ static void consider_ident_for_all_capture_prefix_scopes(StrView tokv, void *k, 
   
   NameprefixScope *np_scope = np_scope_stack;
   
+  // TODO pushing twice?
   void *new_ident = hashmap_put2(is_tag ? &scope->tags : &scope->vars, (char*) tokv.chars, tokv.len, k)->val;
   
   while(np_scope != NULL)
@@ -4097,7 +4098,7 @@ enum { NOT_NP, NP_DECL, NP_ALIAS } get_np_kind(Token *tok)
   }
   else
   {
-    sgs_fprintln(stderr, "Invalid usage of _Nameprefix");
+    error_tok(tok, "Invalid usage of _Nameprefix");
     return -1;
   }
   
